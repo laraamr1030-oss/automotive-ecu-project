@@ -1,0 +1,4 @@
+/home/lara/automotive-ecu-project/BankSystem/build/CMakeFiles/bank.dir
+/home/lara/automotive-ecu-project/BankSystem/build/CMakeFiles/bank_app.dir
+/home/lara/automotive-ecu-project/BankSystem/build/CMakeFiles/edit_cache.dir
+/home/lara/automotive-ecu-project/BankSystem/build/CMakeFiles/rebuild_cache.dir

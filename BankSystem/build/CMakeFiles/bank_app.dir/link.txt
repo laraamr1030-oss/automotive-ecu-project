@@ -1,0 +1,1 @@
+/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/bank_app.dir/link.d CMakeFiles/bank_app.dir/app/main.cpp.o -o bank_app  libbank.a
