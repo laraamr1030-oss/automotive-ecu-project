@@ -1,4 +1,0 @@
-/home/lara/automotive-ecu-project/EmployeeManagement/build/CMakeFiles/employee.dir
-/home/lara/automotive-ecu-project/EmployeeManagement/build/CMakeFiles/employee_app.dir
-/home/lara/automotive-ecu-project/EmployeeManagement/build/CMakeFiles/edit_cache.dir
-/home/lara/automotive-ecu-project/EmployeeManagement/build/CMakeFiles/rebuild_cache.dir

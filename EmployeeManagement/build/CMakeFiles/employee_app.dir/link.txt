@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/employee_app.dir/link.d CMakeFiles/employee_app.dir/app/main.cpp.o -o employee_app  libemployee.a
