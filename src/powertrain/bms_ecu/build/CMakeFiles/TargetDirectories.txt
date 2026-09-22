@@ -1,0 +1,3 @@
+/home/lara/automotive-ecu-project/src/powertrain/bms_ecu/build/CMakeFiles/bms_ecu.dir
+/home/lara/automotive-ecu-project/src/powertrain/bms_ecu/build/CMakeFiles/edit_cache.dir
+/home/lara/automotive-ecu-project/src/powertrain/bms_ecu/build/CMakeFiles/rebuild_cache.dir
