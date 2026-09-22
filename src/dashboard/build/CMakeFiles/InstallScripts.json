@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/lara/automotive-ecu-project/src/dashboard/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
