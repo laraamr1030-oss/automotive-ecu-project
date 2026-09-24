@@ -79,11 +79,13 @@ void TransmissionECU::cyclicTask() {
 }
 
 void TransmissionECU::packTransmissionStatus(uint8_t* buf) const {
-    buf[0] = static_cast<uint8_t>(gear_);
+   
 
     uint16_t speed_raw = static_cast<uint16_t>(vehicle_speed_ / 0.01f);
-    buf[1] = speed_raw & 0xFF;
-    buf[2] = (speed_raw >> 8) & 0xFF;
+    buf[0] = static_cast<uint8_t>(speed_raw & 0xFF);
+    buf[1] = static_cast<uint8_t>((speed_raw >> 8) & 0xFF);
+    
+    buf[2] = static_cast<uint8_t>(gear_);
 
     buf[3] = 1; // SpeedValid = true
 }
