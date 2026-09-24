@@ -1,82 +1,92 @@
 #include "transmission_ecu.h"
 #include <iostream>
 #include <cstring>
-#include <thread>
-#include <chrono>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
 #include <linux/can.h>
 #include <linux/can/raw.h>
-#include <sys/socket.h>
-#include <net/if.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <fcntl.h>
 
-TransmissionECU::TransmissionECU()  = default;
-TransmissionECU::~TransmissionECU() { shutdown(); }
+TransmissionECU::TransmissionECU() : socket_fd_(-1), running_(false), current_gear_(1) {}
 
-void TransmissionECU::run() {
-    state_ = ECUState::INITIALIZING;
-    if (!init()) { state_ = ECUState::FAULT; return; }
-    state_ = ECUState::RUNNING;
-    std::cout << "[TransmissionECU] Running.\n";
-
-    while (state_ == ECUState::RUNNING && !shutdown_requested_) {
-        cyclicTask();
-        std::this_thread::sleep_for(std::chrono::milliseconds(CYCLIC_PERIOD_MS));
-    }
+TransmissionECU::~TransmissionECU() {
     shutdown();
 }
 
-void TransmissionECU::requestShutdown() { shutdown_requested_ = true; }
-
-bool TransmissionECU::init() {
-    can_socket_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (can_socket_ < 0) { perror("socket"); return false; }
-
-    struct ifreq ifr{};
-    std::strncpy(ifr.ifr_name, "vcan0", IFNAMSIZ);
-    if (ioctl(can_socket_, SIOCGIFINDEX, &ifr) < 0) {
-        perror("ioctl"); close(can_socket_); can_socket_ = -1; return false;
+bool TransmissionECU::initSocketCAN(const std::string& interface_name) {
+    socket_fd_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (socket_fd_ < 0) {
+        std::cerr << "[TRANSMISSION ECU] Failed to create socket\n";
+        return false;
     }
 
-    struct sockaddr_can addr{};
-    addr.can_family  = AF_CAN;
+    struct ifreq ifr;
+    std::strncpy(ifr.ifr_name, interface_name.c_str(), IFNAMSIZ - 1);
+    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+
+    if (ioctl(socket_fd_, SIOCGIFINDEX, &ifr) < 0) {
+        std::cerr << "[TRANSMISSION ECU] Failed to get interface index\n";
+        close(socket_fd_);
+        socket_fd_ = -1;
+        return false;
+    }
+
+    struct sockaddr_can addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.can_family = AF_CAN;
     addr.can_ifindex = ifr.ifr_ifindex;
-    if (bind(can_socket_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind"); close(can_socket_); can_socket_ = -1; return false;
+
+    if (bind(socket_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "[TRANSMISSION ECU] Failed to bind socket\n";
+        close(socket_fd_);
+        socket_fd_ = -1;
+        return false;
     }
 
-    // Non-blocking: this ECU both sends and receives on the same socket,
-    // and a blocking read() with no frame waiting would stall the whole loop.
-    int flags = fcntl(can_socket_, F_GETFL, 0);
-    fcntl(can_socket_, F_SETFL, flags | O_NONBLOCK);
+    // Listen exclusively to Engine ECU telemetry (CAN ID 0x100)
+    struct can_filter rfilter[1];
+    rfilter[0].can_id   = 0x100;
+    rfilter[0].can_mask = CAN_SFF_MASK;
+    setsockopt(socket_fd_, SOL_CAN_RAW, CAN_RAW_FILTER, &rfilter, sizeof(rfilter));
+
+    std::cout << "[TRANSMISSION ECU] SocketCAN initialized on " << interface_name << " (Listening to 0x100)\n";
     return true;
 }
 
-void TransmissionECU::cyclicTask() {
-    struct can_frame in{};
-    ssize_t n = read(can_socket_, &in, sizeof(in));
-    if (n > 0 && in.can_id == ENGINE_STATUS_ID) {
-        engine_rpm_    = (in.data[0] | (in.data[1] << 8)) * 0.25f; // matches Engine ECU's encode factor
-        vehicle_speed_ = engine_rpm_ * 0.03f;
-    }
-    // n < 0 with errno EAGAIN/EWOULDBLOCK just means "no frame yet" — not a fault.
-
-    uint8_t buf[8] = {};
-    packTransmissionStatus(buf);
-
-    struct can_frame out{};
-    out.can_id  = TRANS_STATUS_ID;
-    out.can_dlc = 8;
-    std::memcpy(out.data, buf, 8);
-    if (write(can_socket_, &out, sizeof(out)) < 0) {
-        perror("write");
-        state_ = ECUState::FAULT;
+void TransmissionECU::run() {
+    if (socket_fd_ < 0) {
+        std::cerr << "[TRANSMISSION ECU] Cannot run: Socket not initialized\n";
+        return;
     }
 
-    std::cout << "[TransmissionECU] RPM=" << engine_rpm_
-              << " Speed=" << vehicle_speed_ << " km/h, Gear=D\n";
+    running_ = true;
+    std::cout << "[TRANSMISSION ECU] Running inter-ECU processing loop...\n";
+
+    while (running_) {
+        struct can_frame frame;
+        int nbytes = read(socket_fd_, &frame, sizeof(struct can_frame));
+
+        if (nbytes > 0 && frame.can_id == 0x100) {
+            uint16_t rpm = (frame.data[0] << 8) | frame.data[1];
+
+            if (rpm > 3500 && current_gear_ < 6) {
+                current_gear_++;
+                std::cout << "[TRANSMISSION ECU] Auto Upshift -> Gear " << (int)current_gear_ 
+                          << " (Engine RPM: " << rpm << ")\n";
+            } else if (rpm < 1500 && current_gear_ > 1) {
+                current_gear_--;
+                std::cout << "[TRANSMISSION ECU] Auto Downshift -> Gear " << (int)current_gear_ 
+                          << " (Engine RPM: " << rpm << ")\n";
+            }
+        }
+        usleep(100000); // 100ms cycle delay
+    }
 }
+
+ feature/powertrain-and-architecture
+void TransmissionECU::requestShutdown() {
+    running_ = false;
 
 void TransmissionECU::packTransmissionStatus(uint8_t* buf) const {
    
@@ -88,8 +98,13 @@ void TransmissionECU::packTransmissionStatus(uint8_t* buf) const {
     buf[2] = static_cast<uint8_t>(gear_);
 
     buf[3] = 1; // SpeedValid = true
+main
 }
 
 void TransmissionECU::shutdown() {
-    if (can_socket_ >= 0) { close(can_socket_); can_socket_ = -1; }
+    if (socket_fd_ >= 0) {
+        close(socket_fd_);
+        socket_fd_ = -1;
+        std::cout << "[TRANSMISSION ECU] Socket closed\n";
+    }
 }

@@ -1,0 +1,10 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/lara/automotive-ecu-project/build/cmake_install.cmake",
+		"/home/lara/automotive-ecu-project/build/src/powertrain/engine_ecu/cmake_install.cmake",
+		"/home/lara/automotive-ecu-project/build/src/powertrain/transmission_ecu/cmake_install.cmake",
+		"/home/lara/automotive-ecu-project/build/src/powertrain/body_control_module/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
