@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/engine_ecu.dir/link.d CMakeFiles/engine_ecu.dir/main.cpp.o CMakeFiles/engine_ecu.dir/engine_ecu.cpp.o -o engine_ecu
