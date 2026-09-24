@@ -41,16 +41,26 @@ void EngineECU::run() {
         frame.can_id = 0x0C0;
         frame.can_dlc = 8;
 
-        uint16_t raw_rpm = 3000; 
+       // Dynamic simulation tick (or use your scenario counter)
+    static int sim_tick = 0;
+    sim_tick = (sim_tick + 1) % 100;
+    
+    // Unscaled raw RPM value (e.g., swinging between 2000 and 4000 RPM equivalent)
+    // Since CANWorker multiplies by 0.25, we divide our target value by 0.25 to send the correct raw byte
+    uint16_t target_rpm = 2000 + (sim_tick * 20);
+    uint16_t raw_sent_val = static_cast<uint16_t>(target_rpm / 0.25f); 
 
-        // Fix 2: Apply x0.25 scaling factor
-        uint16_t scaled_rpm = static_cast<uint16_t>(raw_rpm * 0.25);
+    // Coolant temp simulation (e.g., starting at 90°C)
+    uint8_t coolant_temp = static_cast<uint8_t>(90 + (sim_tick % 5));
 
-        for(int i = 0; i < 8; ++i) frame.data[i] = 0;
+    for(int i = 0; i < 8; ++i) frame.data[i] = 0;
 
-        // Fix 3 & 4: Little-endian packing into bytes 0 and 1
-        frame.data[0] = static_cast<uint8_t>(scaled_rpm & 0xFF);        
-        frame.data[1] = static_cast<uint8_t>((scaled_rpm >> 8) & 0xFF); 
+    // Little-endian packing: RPM into bytes 0-1, Coolant into byte 2
+    frame.data[0] = static_cast<uint8_t>(raw_sent_val & 0xFF);
+    frame.data[1] = static_cast<uint8_t>((raw_sent_val >> 8) & 0xFF);
+    frame.data[2] = coolant_temp; 
+
+        
 
         write(s, &frame, sizeof(struct can_frame));
         usleep(100000); 
