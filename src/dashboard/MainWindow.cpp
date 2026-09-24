@@ -26,24 +26,42 @@ MainWindow::MainWindow(QWidget *parent)
         }
     )");
 
+    // --- Engine ECU + fault icon row ---
     speedometer_ = new SpeedometerWidget(this);
     engine_speed_label_ = new QLabel("RPM: 0", this);
-    fuel_label_ = new QLabel("Fuel: 0%", this);
-    coolant_temp_label_ = new QLabel("Coolant: 0 °C", this);
-    battery_label_ = new QLabel("Battery: 0 V", this);
+    coolant_temp_label_ = new QLabel("Coolant: 0 \u00b0C", this);
+    gear_label_ = new QLabel("Gear: -", this);
+    check_engine_icon_ = new CheckEngineIcon(this);
 
+    main_layout->addWidget(speedometer_);
+
+    auto *engine_layout = new QHBoxLayout();
+    engine_layout->addWidget(engine_speed_label_);
+    engine_layout->addWidget(coolant_temp_label_);
+    engine_layout->addWidget(gear_label_);
+    engine_layout->addWidget(check_engine_icon_);
+    main_layout->addLayout(engine_layout);
+
+    // --- BMS / battery pack section ---
+    soc_label_ = new QLabel("SoC: 0%", this);
+    pack_temp_label_ = new QLabel("Pack Temp: 0 \u00b0C", this);
+    charging_label_ = new QLabel("Charging: NO", this);
+    pack_voltage_label_ = new QLabel("Pack Voltage: 0 V", this);
+
+    auto *battery_layout = new QGridLayout();
+    battery_layout->addWidget(soc_label_, 0, 0);
+    battery_layout->addWidget(pack_temp_label_, 0, 1);
+    battery_layout->addWidget(charging_label_, 1, 0);
+    battery_layout->addWidget(pack_voltage_label_, 1, 1);
+    main_layout->addLayout(battery_layout);
+
+    // --- Doors ---
     door_fl_label_ = new QLabel("Front Left: CLOSED", this);
     door_fr_label_ = new QLabel("Front Right: CLOSED", this);
     door_rl_label_ = new QLabel("Rear Left: CLOSED", this);
     door_rr_label_ = new QLabel("Rear Right: CLOSED", this);
     turn_signal_label_ = new QLabel("Signals: OFF", this);
 
-    main_layout->addWidget(speedometer_);
-    main_layout->addWidget(engine_speed_label_);
-    main_layout->addWidget(fuel_label_);
-    main_layout->addWidget(coolant_temp_label_);
-    main_layout->addWidget(battery_label_);
-    
     auto *door_layout = new QGridLayout();
     door_layout->addWidget(door_fl_label_, 0, 0);
     door_layout->addWidget(door_fr_label_, 0, 1);
@@ -61,32 +79,56 @@ MainWindow::MainWindow(QWidget *parent)
     connect(can_thread, &QThread::started, can_worker_, &CANWorker::process);
     connect(can_thread, &QThread::finished, can_worker_, &QObject::deleteLater);
 
-    connect(can_worker_, &CANWorker::vehicleSpeedUpdated, this, [this](int speed) {
-        if (speedometer_) speedometer_->setSpeed(speed);
-    });
-
+    // --- Engine ECU (0x0C0) ---
     connect(can_worker_, &CANWorker::engineSpeedUpdated, this, [this](int rpm) {
         engine_speed_label_->setText(QString("RPM: %1").arg(rpm));
     });
 
-    connect(can_worker_, &CANWorker::fuelLevelUpdated, this, [this](float level) {
-        fuel_label_->setText(QString("Fuel: %1%").arg(level, 0, 'f', 1));
-    });
-
     connect(can_worker_, &CANWorker::coolantTempUpdated, this, [this](float temp) {
-        coolant_temp_label_->setText(QString("Coolant: %1 °C").arg(temp, 0, 'f', 1));
+        coolant_temp_label_->setText(QString("Coolant: %1 \u00b0C").arg(temp, 0, 'f', 1));
     });
 
-    connect(can_worker_, &CANWorker::batteryVoltageUpdated, this, [this](float voltage) {
-        battery_label_->setText(QString("Battery: %1 V").arg(voltage, 0, 'f', 1));
+    // --- Transmission ECU (0x0D0) ---
+    // NOTE: vehicleSpeedUpdated now carries a float (km/h with 0.01 scale
+    // per the signal dictionary), so this lambda must take float, not int -
+    // taking int here would silently truncate the decimal.
+    connect(can_worker_, &CANWorker::vehicleSpeedUpdated, this, [this](float speed) {
+        if (speedometer_) speedometer_->setSpeed(speed);
     });
 
+    connect(can_worker_, &CANWorker::currentGearUpdated, this, [this](int gear) {
+        gear_label_->setText(QString("Gear: %1").arg(gear));
+    });
+
+    // --- BMS ECU (0x350) ---
+    connect(can_worker_, &CANWorker::socUpdated, this, [this](float percent) {
+        soc_label_->setText(QString("SoC: %1%").arg(percent, 0, 'f', 1));
+    });
+
+    connect(can_worker_, &CANWorker::packTempUpdated, this, [this](float temp) {
+        pack_temp_label_->setText(QString("Pack Temp: %1 \u00b0C").arg(temp, 0, 'f', 1));
+    });
+
+    connect(can_worker_, &CANWorker::chargingStateUpdated, this, [this](bool charging) {
+        charging_label_->setText(charging ? "Charging: YES" : "Charging: NO");
+    });
+
+    connect(can_worker_, &CANWorker::packVoltageUpdated, this, [this](float voltage) {
+        pack_voltage_label_->setText(QString("Pack Voltage: %1 V").arg(voltage, 0, 'f', 1));
+    });
+
+    // --- Fault indicator ---
+    // Currently driven by CANWorker::simulateFault() until Member 2's real
+    // DTC/fault frame is wired into decodeAndEmit().
+    connect(can_worker_, &CANWorker::faultStatusUpdated, check_engine_icon_, &CheckEngineIcon::setActive);
+
+    // --- Body Control Module (0x320) ---
     connect(can_worker_, &CANWorker::doorStatusUpdated, this,
             [this](bool fl, bool fr, bool rl, bool rr) {
         door_fl_label_->setText(fl ? "Front Left: OPEN" : "Front Left: CLOSED");
         door_fr_label_->setText(fr ? "Front Right: OPEN" : "Front Right: CLOSED");
         door_rl_label_->setText(rl ? "Rear Left: OPEN" : "Rear Left: CLOSED");
-        door_rr_label_->setText(rr ? "Rear Right: CLOSED" : "Rear Right: CLOSED");
+        door_rr_label_->setText(rr ? "Rear Right: OPEN" : "Rear Right: CLOSED");
     });
 
     connect(can_worker_, &CANWorker::turnSignalsChanged, this,

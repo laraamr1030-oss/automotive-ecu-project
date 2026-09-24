@@ -1,0 +1,4 @@
+{
+    "cmake.sourceDirectory": "/home/lojine/Automotive-ecu-project/src/dashboard",
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
+}

@@ -1,0 +1,4 @@
+/home/lojine/Automotive-ecu-project/build/CMakeFiles/dashboard.dir
+/home/lojine/Automotive-ecu-project/build/CMakeFiles/edit_cache.dir
+/home/lojine/Automotive-ecu-project/build/CMakeFiles/rebuild_cache.dir
+/home/lojine/Automotive-ecu-project/build/CMakeFiles/dashboard_autogen.dir
