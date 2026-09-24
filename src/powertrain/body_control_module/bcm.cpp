@@ -51,7 +51,8 @@ void BCM::cyclicTask() {
     runScenario();
 
     uint8_t buf[8] = {};
-    packBCMStatus(buf);
+    
+packBCMStatus(buf);
 
     struct can_frame frame{};
     frame.can_id  = BCM_STATUS_ID;
@@ -78,13 +79,14 @@ void BCM::packBCMStatus(uint8_t* buf) const {
     if (state_.door_fr)  b0 |= (1 << 1);
     if (state_.door_rl)  b0 |= (1 << 2);
     if (state_.door_rr)  b0 |= (1 << 3);
-    if (state_.hazard)   b0 |= (1 << 5);
+   
     buf[0] = b0;
 
     uint8_t b1 = 0;
     if (state_.ignition)   b1 |= (1 << 0);
     if (state_.turn_left)  b1 |= (1 << 1);
     if (state_.turn_right) b1 |= (1 << 2);
+    if (state_.hazard)   b1 |= (1 << 3);
     buf[1] = b1;
 
     buf[2] = static_cast<uint8_t>(state_.battery_volt / 0.1f);
