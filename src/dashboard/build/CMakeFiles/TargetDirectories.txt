@@ -1,5 +1,0 @@
-/home/lara/automotive-ecu-project/src/dashboard/build/CMakeFiles/dashboard.dir
-/home/lara/automotive-ecu-project/src/dashboard/build/CMakeFiles/edit_cache.dir
-/home/lara/automotive-ecu-project/src/dashboard/build/CMakeFiles/rebuild_cache.dir
-/home/lara/automotive-ecu-project/src/dashboard/build/CMakeFiles/dashboard_autogen_timestamp_deps.dir
-/home/lara/automotive-ecu-project/src/dashboard/build/CMakeFiles/dashboard_autogen.dir

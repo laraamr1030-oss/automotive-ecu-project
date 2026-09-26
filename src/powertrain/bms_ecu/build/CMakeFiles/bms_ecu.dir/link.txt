@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/bms_ecu.dir/link.d CMakeFiles/bms_ecu.dir/main.cpp.o CMakeFiles/bms_ecu.dir/bms_ecu.cpp.o -o bms_ecu

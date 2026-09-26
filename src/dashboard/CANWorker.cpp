@@ -25,6 +25,10 @@ void CANWorker::stop() {
     }
 }
 
+void CANWorker::simulateFault(bool active) {
+    emit faultStatusUpdated(active);
+}
+
 bool CANWorker::openSocket() {
     can_socket_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (can_socket_ < 0) return false;
@@ -75,31 +79,29 @@ void CANWorker::run() {
 void CANWorker::decodeAndEmit(canid_t can_id, const uint8_t *data, uint8_t dlc) {
     if (!data) return;
 
-    // Mask standard frame ID
     uint32_t id = can_id & CAN_SFF_MASK;
 
     switch (id) {
-    case 0x0C0: { // Speed & RPM
-        if (dlc >= 4) {
-            int speed = data[0] | (data[1] << 8);
-            int rpm = data[2] | (data[3] << 8);
-            emit vehicleSpeedUpdated(speed);
-            emit engineSpeedUpdated(rpm);
-        }
-        break;
-    }
-    case 0x0D0: { // Engine Temp, Fuel, Battery
+    case 0x0C0: { // Engine ECU -- per docs/signal_dictionary.md
         if (dlc >= 3) {
-            float temp = static_cast<float>(data[0]);
-            float fuel = static_cast<float>(data[1]);
-            float battery = static_cast<float>(data[2]) / 10.0f;
+            uint16_t rpm_raw = static_cast<uint16_t>(data[0] | (data[1] << 8));
+            emit engineSpeedUpdated(static_cast<int>(rpm_raw * 0.25f));
+
+            float temp = static_cast<float>(data[2]) * 1.0f - 40.0f;
             emit coolantTempUpdated(temp);
-            emit fuelLevelUpdated(fuel);
-            emit batteryVoltageUpdated(battery);
         }
         break;
     }
-    case 0x320: { // Doors & Indicators
+    case 0x0D0: { // Transmission ECU -- per docs/signal_dictionary.md
+        if (dlc >= 3) {
+            uint16_t speed_raw = static_cast<uint16_t>(data[0] | (data[1] << 8));
+            emit vehicleSpeedUpdated(speed_raw * 0.01f);
+
+            emit currentGearUpdated(static_cast<int>(data[2]));
+        }
+        break;
+    }
+    case 0x320: { // Body Control Module -- doors + turn signals/hazard
         if (dlc >= 2) {
             bool fl = data[0] & 0x01;
             bool fr = data[0] & 0x02;
@@ -107,14 +109,32 @@ void CANWorker::decodeAndEmit(canid_t can_id, const uint8_t *data, uint8_t dlc) 
             bool rr = data[0] & 0x08;
             emit doorStatusUpdated(fl, fr, rl, rr);
 
-            bool left = data[1] & 0x01;
-            bool right = data[1] & 0x02;
+            bool left   = data[1] & 0x01;
+            bool right  = data[1] & 0x02;
             bool hazard = data[1] & 0x04;
             emit turnSignalsChanged(left, right);
             emit hazardChanged(hazard);
         }
         break;
     }
+    case 0x350: { // BMS ECU -- matches bms_ecu.cpp's packBmsStatus() exactly
+        if (dlc >= 6) {
+            uint16_t soc_raw = static_cast<uint16_t>(data[0] | (data[1] << 8));
+            emit socUpdated(soc_raw * 0.4f);
+
+            float packTemp = static_cast<float>(data[2]) * 0.5f - 40.0f;
+            emit packTempUpdated(packTemp);
+
+            emit chargingStateUpdated(data[3] != 0);
+
+            uint16_t volt_raw = static_cast<uint16_t>(data[4] | (data[5] << 8));
+            emit packVoltageUpdated(volt_raw * 0.1f);
+        }
+        break;
+    }
+    // TODO(team): add a case here for Member 2's fault/DTC frame once its
+    // CAN ID and byte layout are finalized, and emit faultStatusUpdated()
+    // from it instead of relying on simulateFault().
     default:
         break;
     }
