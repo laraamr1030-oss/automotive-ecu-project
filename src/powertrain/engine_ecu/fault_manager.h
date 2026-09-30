@@ -19,6 +19,7 @@
 //   A DTC that failed only ONCE (pending, never confirmed) and then passes
 //   is silently discarded -- a one-cycle glitch must not light the CEL.
 // ---------------------------------------------------------------------------
+#include <cstddef>   //size_t
 #include <cstdint>
 #include <vector>
 
