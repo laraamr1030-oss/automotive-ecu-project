@@ -1,150 +1,124 @@
 #include "uds_handler.h"
 
-#include <cstring>
-#include <iostream>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstring>
+#include <iostream>
 #include <thread>
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <sys/select.h>
 #include <unistd.h>
 
-UDSHandler::UDSHandler(const float& rpm_ref,const float& temp_ref,const float& vehicle_speed_ref,const float& battery_voltage_ref,FaultManager& dtc_manager): rpm_(rpm_ref),coolant_temp_(temp_ref),vehicle_speed_(vehicle_speed_ref),battery_voltage_(battery_voltage_ref),dtc_manager_(dtc_manager) {}
+namespace {
+// Float -> unsigned integer with rounding and clamping (a plain cast of a
+// negative or too-large float is undefined behaviour).
+uint16_t toU16(float v) { return static_cast<uint16_t>(std::lround(std::clamp(v, 0.0f, 65535.0f))); }
+uint8_t  toU8 (float v) { return static_cast<uint8_t >(std::lround(std::clamp(v, 0.0f, 255.0f))); }
+void pushU16(std::vector<uint8_t>& out, uint16_t v) {
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));   // big-endian on UDS
+    out.push_back(static_cast<uint8_t>(v & 0xFF));
+}
+}  // namespace
+
+UDSHandler::UDSHandler(const LiveData& live, FaultManager& dtc_manager)
+    : live_(live), dtc_manager_(dtc_manager) {}
 
 void UDSHandler::handleRequest(const can_frame& req, int can_sock) {
     if (req.can_dlc < 2) return;
 
+    // Byte 0 is the ISO-TP PCI. Only Single Frames (high nibble 0) are
+    // requests; a stray Flow Control (0x3X) must not be parsed as a service.
+    if ((req.data[0] & 0xF0) != 0x00) return;
+
     uint8_t sid = req.data[1];
-    std::cout << "[UDS] Received SID 0x" << std::hex << (int)sid << std::dec << "\n";
+    std::cout << "[UDS] Received SID 0x" << std::hex << static_cast<int>(sid) << std::dec << "\n";
 
     switch (sid) {
         case 0x22: handleReadDataByID(req, can_sock); break;
-        case 0x19: handleReadDTCs(req, can_sock);      break;
-        case 0x14: handleClearDTCs(req, can_sock);      break;
-        case 0x11: handleECUReset(req, can_sock);        break;
-        default:   sendNegativeResponse(sid, 0x11, can_sock); break;
+        case 0x19: handleReadDTCs(req, can_sock);     break;
+        case 0x14: handleClearDTCs(req, can_sock);    break;
+        case 0x11: handleECUReset(req, can_sock);     break;
+        default:   sendNegativeResponse(sid, 0x11, can_sock); break;   // serviceNotSupported
+    }
+}
+
+bool UDSHandler::appendDidData(uint16_t did, const LiveData& d, std::vector<uint8_t>& out) const {
+    switch (did) {
+        case DID_ENGINE_RPM:      pushU16(out, toU16(d.rpm / 0.25f));              return true;
+        case DID_COOLANT_TEMP:    out.push_back(toU8(d.coolant_temp + 40.0f));     return true;
+        case DID_BATTERY_VOLTAGE: pushU16(out, toU16(d.battery_voltage / 0.01f));  return true;
+        case DID_THROTTLE:        out.push_back(toU8(d.throttle / 0.4f));          return true;
+        case DID_ENGINE_RUNNING:  out.push_back(d.running);                        return true;
+        case DID_FAULT_FLAGS:     out.push_back(d.fault_flags);                    return true;
+        case DID_DTC_COUNT:       out.push_back(d.dtc_count);                      return true;
+        case DID_VEHICLE_SPEED:   pushU16(out, toU16(d.vehicle_speed / 0.01f));    return true;
+        case DID_CURRENT_GEAR:    out.push_back(d.gear);                           return true;
+        case DID_DOOR_STATUS:     out.push_back(d.bcm_doors);                      return true;
+        case DID_LIGHT_STATUS:    out.push_back(d.bcm_lights);                     return true;
+        case DID_BCM_BATT_VOLT:   out.push_back(d.bcm_batt_raw);                   return true;
+        case DID_BMS_SOC:         pushU16(out, toU16(d.soc / 0.4f));               return true;
+        case DID_BMS_PACK_TEMP:   out.push_back(toU8((d.pack_temp + 40.0f) / 0.5f)); return true;
+        case DID_BMS_CHARGING:    out.push_back(d.charging);                       return true;
+        case DID_BMS_PACK_VOLT:   pushU16(out, toU16(d.pack_voltage / 0.1f));      return true;
+        default: return false;
     }
 }
 
 void UDSHandler::handleReadDataByID(const can_frame& req, int sock) {
+    // Request: 03 22 <didHigh> <didLow>
     if (req.can_dlc < 4) {
-        sendNegativeResponse(0x22, 0x13, sock);
+        sendNegativeResponse(0x22, 0x13, sock);   // incorrectMessageLengthOrInvalidFormat
         return;
     }
+    uint16_t did = static_cast<uint16_t>((req.data[2] << 8) | req.data[3]);
 
-    uint16_t did = (static_cast<uint16_t>(req.data[2]) << 8) | req.data[3];
-
-    if (did == DID_ENGINE_RPM) {
-        uint16_t raw = static_cast<uint16_t>(rpm_ / 0.25f);
-        std::vector<uint8_t> payload = {
-            0x62, 0x01, 0x01,
-            static_cast<uint8_t>((raw >> 8) & 0xFF),
-            static_cast<uint8_t>(raw & 0xFF)
-        };
-        isoTpSend(payload, sock);
-        std::cout << "[UDS] RPM=" << static_cast<int>(rpm_) << " raw=0x" << std::hex << raw << std::dec << "\n";
+    std::vector<uint8_t> payload = {0x62, req.data[2], req.data[3]};   // positive response SID + echoed DID
+    if (!appendDidData(did, live_, payload)) {
+        sendNegativeResponse(0x22, 0x31, sock);   // requestOutOfRange (unknown DID)
+        return;
     }
-    else if (did == DID_COOLANT_TEMP) {
-        // factor=1.0, offset=-40 -- must match engine_ecu.cpp's
-        // packEngineStatus() and CANWorker.cpp's/uds_tester.py's decode.
-        uint8_t raw = static_cast<uint8_t>(coolant_temp_ + 40.0f);
-        std::vector<uint8_t> payload = {0x62, 0x01, 0x02, raw};
-        isoTpSend(payload, sock);
-        std::cout << "[UDS] Temp=" << coolant_temp_ << "\xC2\xB0" << "C raw=0x" << std::hex << (int)raw << std::dec << "\n";
-    }
-        else if (did == DID_VEHICLE_SPEED) {
-    // Vehicle Speed:
-    // CAN signal: 16 bits, factor = 0.01 km/h, offset = 0
-    std::cout << "[DEBUG] vehicle_speed_="
-          << vehicle_speed_ << " km/h\n";
-    uint16_t raw = static_cast<uint16_t>(vehicle_speed_ / 0.01f);
-
-    std::vector<uint8_t> payload = {
-        0x62, 0x02, 0x01,
-        static_cast<uint8_t>((raw >> 8) & 0xFF),
-        static_cast<uint8_t>(raw & 0xFF)
-    };
-
     isoTpSend(payload, sock);
-
-    std::cout << "[UDS] Vehicle Speed="
-              << vehicle_speed_
-              << " km/h raw=0x"
-              << std::hex << raw << std::dec << "\n";
-        }
-         else if (did == DID_BATTERY_VOLTAGE) {
-        // Battery Voltage:
-        // factor = 0.01 V, offset = 0
-        uint16_t raw =
-            static_cast<uint16_t>(battery_voltage_ / 0.01f);
-
-        std::vector<uint8_t> payload = {
-            0x62, 0x01, 0x03,
-            static_cast<uint8_t>((raw >> 8) & 0xFF),
-            static_cast<uint8_t>(raw & 0xFF)
-        };
-
-        isoTpSend(payload, sock);
-
-        std::cout << "[UDS] Battery Voltage="
-                  << battery_voltage_
-                  << " V raw=0x"
-                  << std::hex << raw << std::dec << "\n";
-        }
-    else {
-        sendNegativeResponse(0x22, 0x31, sock);
-    }
+    std::cout << "[UDS] ReadDataByIdentifier 0x" << std::hex << did << std::dec
+              << " -> " << payload.size() - 3 << " data byte(s)\n";
 }
 
 void UDSHandler::handleReadDTCs(const can_frame& req, int sock) {
-    // Request: 03 19 02 FF 00 00 00 00
-    //          SID=0x19, subFunction=0x02 (reportDTCByStatusMask), mask=0xFF
+    // Request: 03 19 02 <statusMask>     (reportDTCByStatusMask)
+    //     or:  04 19 04 <high> <low> ... (freeze frame, handled separately)
     if (req.can_dlc < 3) {
         sendNegativeResponse(0x19, 0x13, sock);
         return;
     }
     uint8_t sub_function = req.data[2];
-    if (sub_function == 0x04) {
-        handleReadFreezeFrame(req, sock);
-        return;
-    }
+    if (sub_function == 0x04) { handleReadFreezeFrame(req, sock); return; }
     if (sub_function != 0x02) {
-        sendNegativeResponse(0x19, 0x12, sock); // subFunctionNotSupported
+        sendNegativeResponse(0x19, 0x12, sock);   // subFunctionNotSupported
         return;
     }
+    if (req.can_dlc < 4) {
+        sendNegativeResponse(0x19, 0x13, sock);
+        return;
+    }
+    uint8_t mask = req.data[3];
 
-    // This demo doesn't filter by the requested status mask -- it reports
-    // every DTC the FaultManager currently considers active (status != 0),
-    // which is the same set getActiveDTCs() (and Pitfall 1's clearAll()
-    // fix) already govern.
-    std::vector<DTC> active = dtc_manager_.getActiveDTCs();
-
-    std::vector<uint8_t> payload;
-    payload.reserve(3 + active.size() * 3);
-    payload.push_back(0x59);
-    payload.push_back(0x02);
-    payload.push_back(0xFF); // DTCStatusAvailabilityMask
-
-    for (const auto& d : active) {
+    std::vector<uint8_t> payload = {0x59, 0x02, 0xFF};   // response SID, sub-function, availabilityMask
+    int reported = 0;
+    for (const auto& d : dtc_manager_.getActiveDTCs()) {
+        if ((d.status & mask) == 0) continue;            // ISO: report only DTCs matching the mask
         payload.push_back(d.high);
         payload.push_back(d.low);
         payload.push_back(d.status);
+        ++reported;
     }
-
-    std::cout << "[UDS] ReadDTCInformation: " << active.size()
-              << " active DTC(s), sending " << payload.size() << " bytes via ISO-TP\n";
+    std::cout << "[UDS] ReadDTCInformation mask 0x" << std::hex << static_cast<int>(mask) << std::dec
+              << ": " << reported << " DTC(s), " << payload.size() << " bytes via ISO-TP\n";
     isoTpSend(payload, sock);
 }
 
 void UDSHandler::handleReadFreezeFrame(const can_frame& req, int sock) {
-    // Request: 04 19 04 <high> <low> 00 00 00
-    //          SID=0x19, subFunction=0x04, DTC identified by the same
-    //          2-byte (high, low) pair used everywhere else in this demo
-    //          (see fault_manager.h's DTC comment on the 2-byte-vs-3-byte
-    //          departure from the real spec). The trailing snapshot-record
-    //          number byte (real ISO 14229-1 sends one) is accepted but
-    //          ignored -- this demo only ever keeps one snapshot per DTC.
+    // Request: 04 19 04 <high> <low> <recordNumber>
     if (req.can_dlc < 5) {
         sendNegativeResponse(0x19, 0x13, sock);
         return;
@@ -152,57 +126,59 @@ void UDSHandler::handleReadFreezeFrame(const can_frame& req, int sock) {
     uint8_t high = req.data[3];
     uint8_t low  = req.data[4];
 
-    std::vector<DTC> active = dtc_manager_.getActiveDTCs();
     const DTC* found = nullptr;
-    for (const auto& d : active) {
+    std::vector<DTC> stored = dtc_manager_.getActiveDTCs();   // local copy keeps `found` valid
+    for (const auto& d : stored) {
         if (d.high == high && d.low == low) { found = &d; break; }
     }
     if (found == nullptr || !found->freeze_frame.captured) {
-        sendNegativeResponse(0x19, 0x31, sock); // requestOutOfRange -- no such DTC / no snapshot
+        sendNegativeResponse(0x19, 0x31, sock);   // requestOutOfRange: no such DTC / no snapshot
         return;
     }
 
+    // Turn the stored snapshot back into a LiveData so the SAME encoder as
+    // ReadDataByIdentifier produces the bytes -- the two can never disagree.
     const FreezeFrame& ff = found->freeze_frame;
-    uint16_t rpm_raw  = static_cast<uint16_t>(ff.rpm / 0.25f);
-    // Same factor/offset pairs as handleReadDataByID -- must stay in sync.
-    uint8_t  temp_raw = static_cast<uint8_t>(ff.coolant_temp + 40.0f);
-    uint8_t  volt_raw = static_cast<uint8_t>(ff.battery_voltage / 0.1f);
+    LiveData snap;
+    snap.rpm = ff.rpm;               snap.coolant_temp = ff.coolant_temp;
+    snap.battery_voltage = ff.battery_voltage;
+    snap.soc = ff.soc;               snap.pack_temp = ff.pack_temp;
+    snap.pack_voltage = ff.pack_voltage;
 
-    std::vector<uint8_t> payload = {
-        0x59, 0x04, high, low, found->status,
-        0x01,       // DTCSnapshotRecordNumber (only ever one, per DTC)
-        0x03,       // numberOfIdentifiers
-        static_cast<uint8_t>((DID_ENGINE_RPM >> 8) & 0xFF), static_cast<uint8_t>(DID_ENGINE_RPM & 0xFF),
-        static_cast<uint8_t>((rpm_raw >> 8) & 0xFF), static_cast<uint8_t>(rpm_raw & 0xFF),
-        static_cast<uint8_t>((DID_COOLANT_TEMP >> 8) & 0xFF), static_cast<uint8_t>(DID_COOLANT_TEMP & 0xFF),
-        temp_raw,
-        static_cast<uint8_t>((DID_BATTERY_VOLTAGE >> 8) & 0xFF), static_cast<uint8_t>(DID_BATTERY_VOLTAGE & 0xFF),
-        volt_raw
+    static const uint16_t kSnapshotDids[] = {
+        DID_ENGINE_RPM, DID_COOLANT_TEMP, DID_BATTERY_VOLTAGE,
+        DID_BMS_SOC, DID_BMS_PACK_TEMP, DID_BMS_PACK_VOLT
     };
+    const uint8_t n_ids = static_cast<uint8_t>(sizeof(kSnapshotDids) / sizeof(kSnapshotDids[0]));
 
-    std::cout << "[UDS] ReadDTCSnapshot for 0x" << std::hex << (int)high << (int)low << std::dec
-              << ": RPM=" << ff.rpm << " Temp=" << ff.coolant_temp
-              << " Volt=" << ff.battery_voltage << "\n";
+    std::vector<uint8_t> payload = {0x59, 0x04, high, low, found->status,
+                                    0x01,      // DTCSnapshotRecordNumber (one per DTC)
+                                    n_ids};    // numberOfIdentifiers
+    for (uint16_t did : kSnapshotDids) {
+        payload.push_back(static_cast<uint8_t>((did >> 8) & 0xFF));
+        payload.push_back(static_cast<uint8_t>(did & 0xFF));
+        appendDidData(did, snap, payload);
+    }
+    std::cout << "[UDS] Freeze frame for DTC 0x" << std::hex << static_cast<int>(high)
+              << static_cast<int>(low) << std::dec << " (" << payload.size() << " bytes)\n";
     isoTpSend(payload, sock);
 }
 
 void UDSHandler::handleClearDTCs(const can_frame& /*req*/, int sock) {
-    // Pitfall 1 (content.md Section 2.3): a "clear" that only zeroes
-    // testFailed leaves pendingDTC/confirmedDTC set, so getActiveDTCs()
-    // still reports the DTC. clearAll() removes the records entirely.
+    // Request: 04 14 FF FF FF (groupOfDTC = all). clearAll() removes the
+    // records entirely -- zeroing only testFailed would leave them "active".
     dtc_manager_.clearAll();
-    std::vector<uint8_t> payload = {0x54};
-    isoTpSend(payload, sock);
+    isoTpSend({0x54}, sock);   // positive response to 0x14
     std::cout << "[UDS] DTCs cleared.\n";
 }
 
 void UDSHandler::handleECUReset(const can_frame& req, int sock) {
+    // Request: 02 11 01 (hardReset)
     if (req.can_dlc < 3 || req.data[2] != 0x01) {
-        sendNegativeResponse(0x11, 0x12, sock); // subFunctionNotSupported
+        sendNegativeResponse(0x11, 0x12, sock);   // subFunctionNotSupported
         return;
     }
-    std::vector<uint8_t> payload = {0x51, 0x01};
-    isoTpSend(payload, sock);
+    isoTpSend({0x51, 0x01}, sock);
     reset_requested_ = true;
     std::cout << "[UDS] ECU hard reset requested.\n";
 }
