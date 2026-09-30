@@ -1,56 +1,50 @@
+# Phase 1: Network & Bus Design
 
-CAN Protocol Justification
+## Why CAN
+CAN is the backbone for the powertrain and body domains because it balances cost, robustness and speed
+(up to 1 Mbps classic CAN, 500 kbps typical for powertrain). It is a multi-master differential bus with
+arbitration by ID and built-in error detection, which suits a noisy vehicle.
 
-​Why CAN (Controller Area Network)? CAN is chosen as the primary backbone for our powertrain and body control domains because it offers an optimal balance of cost, robustness, and speed (up to 1 Mbps). It uses a multi-master differential bus topology, ensuring high noise immunity which is critical for harsh automotive environments.
+| Alternative | Why not for this project |
+| :--- | :--- |
+| LIN (max 20 kbps) | Single-master, far too slow for RPM/SoC telemetry and UDS transfers; fine for mirrors/windows. |
+| FlexRay (10 Mbps) | Deterministic but expensive and complex; overkill for a handful of ECUs at 10 Hz. |
+| Automotive Ethernet (100 Mbps+) | Needed for cameras/infotainment, but switch/PHY cost and protocol overhead are unjustified here. |
 
-Trade-off Analysis vs. Alternatives:
+Per the architecture diagram: Powertrain CAN runs at **500 kbps**; that is the rate used below.
 
-vs. LIN (Local Interconnect Network): LIN is too slow (max 20 kbps) and is limited to simple sub-network devices (like window lifts or mirrors). It lacks the bandwidth required for real-time powertrain telemetry like engine RPM and BMS data.
+## Bus-load calculation (real message set)
 
-​vs. FlexRay: While FlexRay offers higher speed and determinism, it is significantly more expensive and complex to implement, making it overkill for our standard multi-ECU project scope.
+| CAN ID | Sender | Period | Msgs/s | DLC | Bits/frame |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| 0x0C0 | Engine ECU | 100 ms | 10 | 8 | 111 |
+| 0x0C1 | Engine ECU (fault status) | 100 ms | 10 | 3 | 71 |
+| 0x0D0 | Transmission ECU | 100 ms | 10 | 8 | 111 |
+| 0x320 | BCM | 100 ms | 10 | 8 | 111 |
+| 0x350 | BMS ECU | 100 ms | 10 | 8 | 111 |
 
-vs. Ethernet (Automotive Ethernet): Ethernet provides massive bandwidth for high-definition cameras and infotainment systems, but introduces unnecessary protocol overhead and hardware costs for standard ECU sensor-to-dashboard communication.
+Bits per standard frame (no stuffing) = 47 + 8 × DLC → DLC 8 = 111 bits, DLC 3 = 71 bits
+(SOF 1 + ID 11 + RTR 1 + IDE 1 + r0 1 + DLC 4 + data + CRC 15 + CRC-delim 1 + ACK 2 + EOF 7 + IFS 3).
 
+```
+Traffic = 4 frames x 10/s x 111 bits + 1 frame x 10/s x 71 bits
+        = 4440 + 710 = 5150 bit/s
 
-Bus-Load Calculation
+Bus load = 5150 / 500 000 x 100 = 1.03 %     (0.52 % if the bus ran at 1 Mbps)
+```
+Worst case with maximum bit stuffing (135 bits for DLC 8, 85 bits for DLC 3):
+4 × 10 × 135 + 10 × 85 = 6250 bit/s → **1.25 %**. UDS traffic is on demand only (a 29-byte freeze-frame answer =
+1 First Frame + 4 Consecutive Frames + 1 Flow Control ≈ 670 bits, i.e. a 1.3 ms burst) and does not change the result.
+Conclusion: the bus is very lightly loaded (well under the usual 30-40 % design limit), leaving room for growth.
 
-Standard CAN 2.0 Frame Overhead: A standard CAN frame consists of an average of about 111 bits per message (including arbitration ID, control bits, data payload, CRC, and ACK slots).
-
-Our Team's Message Set & Cycle Times:
-
-Engine ECU (0x0C0): Transmitted every 10 ms (100 messages/sec).
-
-Transmission ECU (0x0D0): Transmitted every 20 ms (50 messages/sec).
-
-BCM (0x320): Transmitted every 100 ms (10 messages/sec).
-
-BMS ECU (0x350 / Theme ECU): Transmitted every 50 ms (20 messages/sec).
-
-
-Total Bitrate Consumption:
-
-Engine: 100 \times 111 = 11,100 bits/sec
-
-​Transmission: 50 \times 111 = 5,550 bits/sec
-
-​BCM: 10 \times 111 = 1,110 bits/sec
-
-​BMS: 20 \times 111 = 2,220 bits/sec
-
-​Total Traffic: 19,980 bits/sec (~20 kbps)
-
-
-Bus Load Formula & Result:
-
-
-\text{Bus Load (\%)} = \left( \frac{\text{Total Traffic}}{\text{CAN Bus Speed (1,000,000 bps)}} \right) \times 100
-
-vcan0 Setup Confirmation
-​Interface Verification:
-
- The system utilizes Linux SocketCAN virtual interface (vcan0) to emulate physical hardware buses during development.
-
-
-​Validation: 
-
-Verified that all ECU processes successfully bind to vcan0, allowing concurrent broadcasting and monitoring via utilities like candump and cansniffer without packet loss.
+## vcan0 setup (Session 6)
+```bash
+sudo modprobe vcan
+sudo ip link add dev vcan0 type vcan
+sudo ip link set up vcan0
+ip link show vcan0            # must show "UP"
+```
+All ECU processes and the dashboard open a `PF_CAN / SOCK_RAW` socket bound to `vcan0`. Verified with
+`candump vcan0` / `cansniffer vcan0` showing 0x0C0, 0x0C1, 0x0D0, 0x320 and 0x350 simultaneously
+(capture: `docs/evidence/candump_all_ids.log`). Note `vcan0` has no bit rate; the 500 kbps figure is the
+physical bus this virtual bus models.

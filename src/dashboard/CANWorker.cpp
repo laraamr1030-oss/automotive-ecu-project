@@ -1,10 +1,12 @@
 #include "CANWorker.h"
 #include <QDebug>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
+#include <cerrno>
 #include <cstring>
+#include <net/if.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 CANWorker::CANWorker(QObject *parent) : QObject(parent) {}
 
@@ -17,27 +19,18 @@ void CANWorker::process() {
 }
 
 void CANWorker::stop() {
-    running_ = false;
-    stop_ = true;
-    if (can_socket_ >= 0) {
-        close(can_socket_);
-        can_socket_ = -1;
-    }
-}
-
-void CANWorker::simulateFault(bool active) {
-    emit faultStatusUpdated(active);
+    stop_ = true;   // run() polls with a 100 ms timeout, sees this, closes the socket itself
 }
 
 bool CANWorker::openSocket() {
-    can_socket_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (can_socket_ < 0) return false;
+    int fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (fd < 0) return false;
 
     struct ifreq ifr;
-    std::strcpy(ifr.ifr_name, "vcan0");
-    if (ioctl(can_socket_, SIOCGIFINDEX, &ifr) < 0) {
-        close(can_socket_);
-        can_socket_ = -1;
+    std::memset(&ifr, 0, sizeof(ifr));
+    std::strncpy(ifr.ifr_name, "vcan0", IFNAMSIZ - 1);
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+        close(fd);
         return false;
     }
 
@@ -46,34 +39,60 @@ bool CANWorker::openSocket() {
     addr.can_family = AF_CAN;
     addr.can_ifindex = ifr.ifr_ifindex;
 
-    if (bind(can_socket_, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(can_socket_);
-        can_socket_ = -1;
+    if (bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
+        close(fd);
         return false;
     }
 
+    can_socket_ = fd;
     return true;
 }
 
 void CANWorker::run() {
     if (!openSocket()) {
-        qWarning() << "Failed to open vcan0 socket";
+        qWarning() << "Failed to open vcan0 socket (is vcan0 up?)";
         return;
     }
 
-    running_ = true;
-    stop_ = false;
-    struct can_frame frame;
+    struct pollfd pfd;
+    pfd.fd = can_socket_;
+    pfd.events = POLLIN;
 
-    while (running_ && !stop_) {
-        ssize_t nbytes = read(can_socket_, &frame, sizeof(struct can_frame));
-        if (nbytes < 0) {
+    while (!stop_) {
+        // Wait for a frame, but wake up every 100 ms so stop() is noticed.
+        int rc = poll(&pfd, 1, 100);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
             break;
         }
-        if (nbytes == sizeof(struct can_frame)) {
+        if (rc == 0) continue;   // timeout, no frame
+
+        struct can_frame frame;
+        ssize_t nbytes = read(can_socket_, &frame, sizeof(frame));
+        if (nbytes < 0) break;
+        if (nbytes == static_cast<ssize_t>(sizeof(frame))) {
             decodeAndEmit(frame.can_id, frame.data, frame.can_dlc);
         }
     }
+
+    int fd = can_socket_.exchange(-1);
+    if (fd >= 0) close(fd);
+}
+
+bool CANWorker::sendClearDtcRequest() {
+    int fd = can_socket_;
+    if (fd < 0) return false;
+
+    struct can_frame req;
+    std::memset(&req, 0, sizeof(req));
+    req.can_id  = 0x7E0;                    // UDS request ID (tester -> ECU)
+    req.can_dlc = 8;
+    req.data[0] = 0x04;                     // ISO-TP Single Frame, 4 payload bytes
+    req.data[1] = 0x14;                     // SID ClearDiagnosticInformation
+    req.data[2] = 0xFF;                     // groupOfDTC = 0xFFFFFF (all DTCs)
+    req.data[3] = 0xFF;
+    req.data[4] = 0xFF;
+    return write(fd, &req, sizeof(req)) == static_cast<ssize_t>(sizeof(req));
 }
 
 void CANWorker::decodeAndEmit(canid_t can_id, const uint8_t *data, uint8_t dlc) {
@@ -82,59 +101,59 @@ void CANWorker::decodeAndEmit(canid_t can_id, const uint8_t *data, uint8_t dlc) 
     uint32_t id = can_id & CAN_SFF_MASK;
 
     switch (id) {
-    case 0x0C0: { // Engine ECU -- per docs/signal_dictionary.md
-        if (dlc >= 3) {
+    case 0x0C0: { // Engine ECU -- see docs/signal_dictionary.md
+        if (dlc >= 8) {
             uint16_t rpm_raw = static_cast<uint16_t>(data[0] | (data[1] << 8));
             emit engineSpeedUpdated(static_cast<int>(rpm_raw * 0.25f));
-
-            float temp = static_cast<float>(data[2]) * 1.0f - 40.0f;
-            emit coolantTempUpdated(temp);
+            emit coolantTempUpdated(static_cast<float>(data[4]) * 1.0f - 40.0f);  // byte 4, NOT byte 2
+            emit throttleUpdated(static_cast<float>(data[5]) * 0.4f);
+            emit systemVoltageUpdated(static_cast<float>(data[7]) * 0.1f);
         }
         break;
     }
-    case 0x0D0: { // Transmission ECU -- per docs/signal_dictionary.md
+    case 0x0C1: { // Engine ECU fault status -- REAL fault data (replaces simulateFault())
+        if (dlc >= 3) {
+            emit faultFlagsUpdated(data[0]);
+            emit dtcCountUpdated(data[1]);
+            emit faultStatusUpdated(data[2] != 0);   // CEL follows the ECU's warning-lamp request
+        }
+        break;
+    }
+    case 0x0D0: { // Transmission ECU
         if (dlc >= 3) {
             uint16_t speed_raw = static_cast<uint16_t>(data[0] | (data[1] << 8));
             emit vehicleSpeedUpdated(speed_raw * 0.01f);
-
             emit currentGearUpdated(static_cast<int>(data[2]));
         }
         break;
     }
-    case 0x320: { // Body Control Module -- doors + turn signals/hazard
+    case 0x320: { // Body Control Module -- layout = bcm.cpp packBCMStatus()
         if (dlc >= 2) {
-            bool fl = data[0] & 0x01;
-            bool fr = data[0] & 0x02;
-            bool rl = data[0] & 0x04;
-            bool rr = data[0] & 0x08;
-            emit doorStatusUpdated(fl, fr, rl, rr);
-
-            bool left   = data[1] & 0x01;
-            bool right  = data[1] & 0x02;
-            bool hazard = data[1] & 0x04;
-            emit turnSignalsChanged(left, right);
-            emit hazardChanged(hazard);
+            emit doorStatusUpdated(data[0] & 0x01, data[0] & 0x02, data[0] & 0x04, data[0] & 0x08);
+            emit hazardChanged((data[0] & 0x20) != 0);                          // byte0 bit5
+            emit turnSignalsChanged((data[1] & 0x02) != 0, (data[1] & 0x04) != 0); // byte1 bit1 left, bit2 right
         }
         break;
     }
-    case 0x350: { // BMS ECU -- matches bms_ecu.cpp's packBmsStatus() exactly
+    case 0x350: { // BMS ECU -- matches bms_ecu.cpp packBmsStatus()
         if (dlc >= 6) {
             uint16_t soc_raw = static_cast<uint16_t>(data[0] | (data[1] << 8));
             emit socUpdated(soc_raw * 0.4f);
-
-            float packTemp = static_cast<float>(data[2]) * 0.5f - 40.0f;
-            emit packTempUpdated(packTemp);
-
+            emit packTempUpdated(static_cast<float>(data[2]) * 0.5f - 40.0f);
             emit chargingStateUpdated(data[3] != 0);
-
             uint16_t volt_raw = static_cast<uint16_t>(data[4] | (data[5] << 8));
             emit packVoltageUpdated(volt_raw * 0.1f);
         }
         break;
     }
-    // TODO(team): add a case here for Member 2's fault/DTC frame once its
-    // CAN ID and byte layout are finalized, and emit faultStatusUpdated()
-    // from it instead of relying on simulateFault().
+    case 0x7E8: { // UDS response -- we only care about the answer to our own clear request
+        if (dlc >= 2 && data[0] == 0x01 && data[1] == 0x54) {
+            emit clearDtcResponse(true);                       // 01 54 = positive response to 0x14
+        } else if (dlc >= 4 && data[0] == 0x03 && data[1] == 0x7F && data[2] == 0x14) {
+            emit clearDtcResponse(false);                      // 03 7F 14 <nrc> = negative response
+        }
+        break;
+    }
     default:
         break;
     }

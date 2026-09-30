@@ -16,6 +16,7 @@ set(SOURCES
     main.cpp
     MainWindow.cpp
     SpeedometerWidget.cpp
+    BatteryGaugeWidget.cpp
     CANWorker.cpp
     CheckEngineIcon.cpp
 )
@@ -23,13 +24,14 @@ set(SOURCES
 set(HEADERS
     MainWindow.h
     SpeedometerWidget.h
+    BatteryGaugeWidget.h
     CANWorker.h
     CheckEngineIcon.h
 )
 
 add_executable(dashboard ${SOURCES} ${HEADERS})
 
-target_link_libraries(dashboard PRIVATE 
+target_link_libraries(dashboard PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
     Qt${QT_VERSION_MAJOR}::Svg
