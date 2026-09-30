@@ -2,6 +2,7 @@
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <thread>
 #include <chrono>
 #include <linux/can.h>
@@ -62,12 +63,26 @@ bool BMSEcu::init() {
 }
 
 void BMSEcu::cyclicTask() {
-    // Simulate gradual discharge or temperature fluctuation
-    soc_ -= 0.01f;
-    soc_ = std::clamp(soc_, 0.0f, 100.0f);
+    // Scripted 60 s scenario (repeats), so the diagnostics side sees real faults
+    // appear AND disappear instead of a value that only ever drifts one way:
+    //   0-10 s  normal driving
+    //  10-42 s  thermal event: pack heats toward 65 C   (> 55 C -> P0A7E)
+    //  30-45 s  load sag: pack voltage falls toward 300 V (< 320 V -> P0AFA)
+    //  52-60 s  charging: SoC climbs
+    ++tick_;
+    const double t = std::fmod(tick_ * (CYCLIC_PERIOD_MS / 1000.0), 60.0);
 
-    pack_temp_ += 0.02f;
+    const float temp_target = (t >= 10.0 && t < 42.0) ? 65.0f : 30.0f;
+    const float temp_rate   = (temp_target > pack_temp_) ? 0.02f : 0.03f;   // heats slower than it cools
+    pack_temp_ += (temp_target - pack_temp_) * temp_rate;
     pack_temp_ = std::clamp(pack_temp_, -40.0f, 85.0f);
+
+    const float volt_target = (t >= 30.0 && t < 45.0) ? 300.0f : 350.0f;
+    pack_voltage_ += (volt_target - pack_voltage_) * 0.05f;
+
+    charging_state_ = (t >= 52.0) ? 1 : 0;
+    soc_ += charging_state_ ? 0.03f : -0.01f;
+    soc_ = std::clamp(soc_, 0.0f, 100.0f);
 
     uint8_t buf[8] = {};
     packBmsStatus(buf);
