@@ -1,0 +1,6 @@
+CAN IDs seen on vcan0 during a 10 s capture (count  ID):
+     98 0C0
+     98 0C1
+     98 0D0
+     98 320
+     98 350

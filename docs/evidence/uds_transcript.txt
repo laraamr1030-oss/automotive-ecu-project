@@ -1,0 +1,118 @@
+=== UDS Diagnostic Tester (EV theme: Engine + BMS) ===
+Connecting to vcan0 ...
+
+[1] SID 0x22 ReadDataByIdentifier -- every DID in the signal dictionary
+  DID 0x0101  Engine speed                 = 1905.50 rpm
+  [PASS] DID 0x0101 Engine speed
+  DID 0x0102  Coolant temperature          = 85.00 degC
+  [PASS] DID 0x0102 Coolant temperature
+  DID 0x0103  12 V system voltage          = 14.20 V
+  [PASS] DID 0x0103 12 V system voltage
+  DID 0x0104  Throttle position            = 33.20 %
+  [PASS] DID 0x0104 Throttle position
+  DID 0x0105  Engine running               = 1 
+  [PASS] DID 0x0105 Engine running
+  DID 0x0106  Fault flags (bitfield)       = 0x0A 
+  [PASS] DID 0x0106 Fault flags (bitfield)
+  DID 0x0107  Stored DTC count             = 5 
+  [PASS] DID 0x0107 Stored DTC count
+  DID 0x0201  Vehicle speed                = 90.69 km/h
+  [PASS] DID 0x0201 Vehicle speed
+  DID 0x0202  Current gear                 = 5 
+  [PASS] DID 0x0202 Current gear
+  DID 0x0301  Door/hazard bits (BCM b0)    = 0b00000000 
+  [PASS] DID 0x0301 Door/hazard bits (BCM b0)
+  DID 0x0302  Ignition/turn bits (BCM b1)  = 0b00000001 
+  [PASS] DID 0x0302 Ignition/turn bits (BCM b1)
+  DID 0x0303  BCM battery voltage          = 14.00 V
+  [PASS] DID 0x0303 BCM battery voltage
+  DID 0x0401  BMS state of charge          = 79.60 %
+  [PASS] DID 0x0401 BMS state of charge
+  DID 0x0402  BMS pack temperature         = 63.00 degC
+  [PASS] DID 0x0402 BMS pack temperature
+  DID 0x0403  BMS charging state           = 0 
+  [PASS] DID 0x0403 BMS charging state
+  DID 0x0404  BMS pack voltage             = 349.90 V
+  [PASS] DID 0x0404 BMS pack voltage
+
+[2] Negative responses (7F <SID> <NRC>)
+  [PASS] unknown DID 0x9999 -> 7F 22 31 requestOutOfRange
+  [PASS] unsupported SID 0x27 -> 7F 27 11 serviceNotSupported
+  [PASS] ECUReset sub-function 0x02 -> 7F 11 12 subFunctionNotSupported
+  [PASS] ReadDTC sub-function 0x07 -> 7F 19 12 subFunctionNotSupported
+  [PASS] freeze frame of non-existent DTC -> 7F 19 31
+
+[3] Watching DTC lifecycle live (up to 30 s; faults appear on the ECU's 60 s drive cycle)
+    [ISO-TP] First Frame, total 18 bytes -> sending Flow Control (CTS)
+  t+  0.1s  P0A7E=0x8D (testFailed|pendingDTC|confirmedDTC|warningIndicatorRequested); P0300=0x8D (testFailed|pendingDTC|confirmedDTC|warningIndicatorRequested); P0117=0x88 (confirmedDTC|warningIndicatorRequested); P0AFA=0x88 (confirmedDTC|warningIndicatorRequested); P0563=0x88 (confirmedDTC|warningIndicatorRequested)
+  [PASS] a DTC is confirmed (was already past pending when we started)
+
+[4] SID 0x19 ReadDTCInformation
+  sub 0x02, mask 0xFF (all stored DTCs):
+    [ISO-TP] First Frame, total 18 bytes -> sending Flow Control (CTS)
+    P0A7E  status=0x8D (testFailed|pendingDTC|confirmedDTC|warningIndicatorRequested)
+    P0300  status=0x8D (testFailed|pendingDTC|confirmedDTC|warningIndicatorRequested)
+    P0117  status=0x88 (confirmedDTC|warningIndicatorRequested)
+    P0AFA  status=0x88 (confirmedDTC|warningIndicatorRequested)
+    P0563  status=0x88 (confirmedDTC|warningIndicatorRequested)
+  [PASS] reportDTCByStatusMask(0xFF) returned records
+  sub 0x02, mask 0x08 (confirmed only):
+    [ISO-TP] First Frame, total 18 bytes -> sending Flow Control (CTS)
+    P0A7E  status=0x8D (testFailed|pendingDTC|confirmedDTC|warningIndicatorRequested)
+    P0300  status=0x8D (testFailed|pendingDTC|confirmedDTC|warningIndicatorRequested)
+    P0117  status=0x88 (confirmedDTC|warningIndicatorRequested)
+    P0AFA  status=0x88 (confirmedDTC|warningIndicatorRequested)
+    P0563  status=0x88 (confirmedDTC|warningIndicatorRequested)
+  [PASS] mask 0x08 returns only confirmed DTCs
+  sub 0x04 (freeze frame) for every stored DTC:
+    [ISO-TP] First Frame, total 29 bytes -> sending Flow Control (CTS)
+    P0A7E  snapshot #1  status=0x8D (testFailed|pendingDTC|confirmedDTC|warningIndicatorRequested)
+        0x0101 Engine speed             2192.00 rpm
+        0x0102 Coolant temperature      83.00 degC
+        0x0103 12 V system voltage      14.20 V
+        0x0401 BMS state of charge      82.80 %
+        0x0402 BMS pack temperature     58.00 degC
+        0x0404 BMS pack voltage         350.00 V
+    [ISO-TP] First Frame, total 29 bytes -> sending Flow Control (CTS)
+    P0300  snapshot #1  status=0x8D (testFailed|pendingDTC|confirmedDTC|warningIndicatorRequested)
+        0x0101 Engine speed             2463.25 rpm
+        0x0102 Coolant temperature      83.00 degC
+        0x0103 12 V system voltage      14.20 V
+        0x0401 BMS state of charge      82.80 %
+        0x0402 BMS pack temperature     60.00 degC
+        0x0404 BMS pack voltage         350.00 V
+    [ISO-TP] First Frame, total 29 bytes -> sending Flow Control (CTS)
+    P0117  snapshot #1  status=0x88 (confirmedDTC|warningIndicatorRequested)
+        0x0101 Engine speed             2200.00 rpm
+        0x0102 Coolant temperature      107.00 degC
+        0x0103 12 V system voltage      14.20 V
+        0x0401 BMS state of charge      81.60 %
+        0x0402 BMS pack temperature     64.50 degC
+        0x0404 BMS pack voltage         317.90 V
+    [ISO-TP] First Frame, total 29 bytes -> sending Flow Control (CTS)
+    P0AFA  snapshot #1  status=0x88 (confirmedDTC|warningIndicatorRequested)
+        0x0101 Engine speed             2200.00 rpm
+        0x0102 Coolant temperature      107.00 degC
+        0x0103 12 V system voltage      14.20 V
+        0x0401 BMS state of charge      81.60 %
+        0x0402 BMS pack temperature     64.50 degC
+        0x0404 BMS pack voltage         317.90 V
+    [ISO-TP] First Frame, total 29 bytes -> sending Flow Control (CTS)
+    P0563  snapshot #1  status=0x88 (confirmedDTC|warningIndicatorRequested)
+        0x0101 Engine speed             2200.00 rpm
+        0x0102 Coolant temperature      109.00 degC
+        0x0103 12 V system voltage      15.94 V
+        0x0401 BMS state of charge      80.80 %
+        0x0402 BMS pack temperature     64.50 degC
+        0x0404 BMS pack voltage         300.10 V
+  [PASS] freeze frame (6 identifiers) readable for every stored DTC
+
+[5] SID 0x14 ClearDiagnosticInformation
+  [PASS] ClearDiagnosticInformation -> positive response 0x54
+  DTCs right after clear: none
+  [PASS] no confirmed DTC remains right after clear
+
+[6] SID 0x11 ECUReset (hardReset)
+  [PASS] ECUReset -> positive response 51 01
+
+=== 28/28 checks passed ===
