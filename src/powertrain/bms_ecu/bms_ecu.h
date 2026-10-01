@@ -41,6 +41,7 @@ private:
     float pack_temp_ = 25.0f;     // Pack temperature in Celsius
     float pack_voltage_ = 350.0f; // Voltage in Volts
     uint8_t charging_state_ = 0;  // 0: Discharging, 1: Charging
+    uint64_t tick_ = 0;           // 100 ms ticks since start (drives the 60 s scenario)
 
     static constexpr uint32_t BMS_STATUS_ID = 0x350;
     static constexpr int CYCLIC_PERIOD_MS = 100;
