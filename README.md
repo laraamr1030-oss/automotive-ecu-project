@@ -12,9 +12,9 @@ CAN 2.0, UDS ISO 14229-1, ISO-TP ISO 15765-2, DTC / freeze frame, Python `python
 ## Team and roles
 | Member | Role | Owns |
 | :--- | :--- | :--- |
-| Member 1 — _<name>_ | Architecture & Powertrain Lead | Architecture diagram, network design, Engine/Transmission/BMS ECUs |
-| Member 2 — _<name>_ | Diagnostics Dev | UDS handler, Python tester, FaultManager / DTC / freeze frame |
-| Member 3 — _<name>_ | Dashboard & Integration Dev | Qt dashboard, CAN worker thread, integration, build, docs |
+| Member 1 — laraamr1030-oss | Architecture & Powertrain Lead | Architecture diagram, network design, Engine/Transmission/BMS ECUs |
+| Member 2 — YoussiAhmedEissa | Diagnostics Dev | UDS handler, Python tester, FaultManager / DTC / freeze frame |
+| Member 3 — lojine | Dashboard & Integration Dev | Qt dashboard, CAN worker thread, integration, build, docs |
 
 ## Architecture at a glance
 | Process | CAN IDs it sends | Notes |
