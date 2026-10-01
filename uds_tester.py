@@ -1,70 +1,87 @@
 #!/usr/bin/env python3
 """
-Session 14 Demo — UDS Diagnostic Tester for the Fault Dashboard Demo
+UDS diagnostic tester for the EV Engine/BMS ECU  (python-can, vcan0)
 
-Same real ISO-TP receiver (read_response()) as Session 13's demo tester,
-reused verbatim here, now driving ReadDTCInformation (SID 0x19, both
-sub-function 0x02 reportDTCByStatusMask and 0x04
-reportDTCSnapshotRecordByDTCNumber -- the freeze frame) and
-ClearDiagnosticInformation (SID 0x14) against the fault Engine ECU's live
-FaultManager instead of an empty placeholder DTC list.
+Exercises every service the ECU implements and every DID in the signal dictionary:
+  SID 0x22 ReadDataByIdentifier      - all 16 DIDs, decoded with the dictionary's factor/offset
+  SID 0x19 ReadDTCInformation        - sub 0x02 (by status mask) and sub 0x04 (freeze frame)
+  SID 0x14 ClearDiagnosticInformation
+  SID 0x11 ECUReset
+  + negative responses (NRC 0x11, 0x12, 0x13-style, 0x31)
+and watches a DTC go pending (0x05) -> confirmed (0x8D) live.
 
-Run this at any point while engine_ecu_fault is running (standalone, or via
-run_demo.sh alongside the dashboard) to watch the DTC status byte evolve:
-pending (0x05) -> confirmed (0x8D) -> persists after the condition clears ->
-fully removed only after an explicit clear (content.md Section 2.3 / Pitfall 1).
-Also reads back each active DTC's freeze frame -- the RPM/coolant
-temp/battery voltage captured at the instant it was first set (content.md's
-freeze-frame learning objective).
+Usage:   python3 uds_tester.py                  # waits (default 90 s) for a fault to confirm
+         python3 uds_tester.py --wait-timeout 0 # do not wait for faults
+Record:  python3 uds_tester.py | tee docs/evidence/uds_transcript.txt
 """
+from __future__ import annotations
 
+import argparse
+import sys
 import time
 
 import can
 
-UDS_REQUEST_ID   = 0x7E0   # tester -> ECU
-UDS_RESPONSE_ID  = 0x7E8   # ECU -> tester
-ENGINE_STATUS_ID = 0x0C0   # ECU's unrelated 100ms cyclic broadcast
-FAULT_STATUS_ID  = 0x0C1   # ECU's unrelated 100ms fault-status broadcast
-
-DID_ENGINE_RPM    = 0x0101
-DID_COOLANT_TEMP  = 0x0102
-DID_VEHICLE_SPEED = 0x0201
-DID_BATTERY_VOLTAGE = 0x0103
-
+UDS_REQUEST_ID = 0x7E0    # tester -> ECU
+UDS_RESPONSE_ID = 0x7E8   # ECU -> tester
 ISOTP_TIMEOUT_S = 2.0
 
-# ISO 14229-1 DTC status byte bits (content.md Section 2.2) -- mirrors
-# fault_manager.h's constants so the tester can print human-readable status.
+DID_ENGINE_RPM = 0x0101
+DID_COOLANT_TEMP = 0x0102
+DID_BATTERY_VOLTAGE = 0x0103
+
+# (DID, name, unit, data length in bytes, decode(bytes) -> value)  -- factors/offsets = docs/signal_dictionary.md
+def _u16(b): return (b[0] << 8) | b[1]
+DID_TABLE = [
+    (0x0101, "Engine speed",            "rpm",  2, lambda b: _u16(b) * 0.25),
+    (0x0102, "Coolant temperature",     "degC", 1, lambda b: b[0] * 1.0 - 40.0),
+    (0x0103, "12 V system voltage",     "V",    2, lambda b: _u16(b) * 0.01),
+    (0x0104, "Throttle position",       "%",    1, lambda b: b[0] * 0.4),
+    (0x0105, "Engine running",          "",     1, lambda b: b[0]),
+    (0x0106, "Fault flags (bitfield)",  "",     1, lambda b: f"0x{b[0]:02X}"),
+    (0x0107, "Stored DTC count",        "",     1, lambda b: b[0]),
+    (0x0201, "Vehicle speed",           "km/h", 2, lambda b: _u16(b) * 0.01),
+    (0x0202, "Current gear",            "",     1, lambda b: b[0]),
+    (0x0301, "Door/hazard bits (BCM b0)", "",   1, lambda b: f"0b{b[0]:08b}"),
+    (0x0302, "Ignition/turn bits (BCM b1)", "", 1, lambda b: f"0b{b[0]:08b}"),
+    (0x0303, "BCM battery voltage",     "V",    1, lambda b: b[0] * 0.1),
+    (0x0401, "BMS state of charge",     "%",    2, lambda b: _u16(b) * 0.4),
+    (0x0402, "BMS pack temperature",    "degC", 1, lambda b: b[0] * 0.5 - 40.0),
+    (0x0403, "BMS charging state",      "",     1, lambda b: b[0]),
+    (0x0404, "BMS pack voltage",        "V",    2, lambda b: _u16(b) * 0.1),
+]
+DID_INFO = {row[0]: row for row in DID_TABLE}
+
 DTC_BITS = [
-    (0x01, "testFailed"),
-    (0x02, "testFailedThisMonitoringCycle"),
-    (0x04, "pendingDTC"),
-    (0x08, "confirmedDTC"),
-    (0x10, "testNotCompletedSinceLastClear"),
-    (0x20, "testFailedSinceLastClear"),
-    (0x40, "testNotCompletedThisMonitoringCycle"),
+    (0x01, "testFailed"), (0x02, "testFailedThisMonitoringCycle"), (0x04, "pendingDTC"),
+    (0x08, "confirmedDTC"), (0x10, "testNotCompletedSinceLastClear"),
+    (0x20, "testFailedSinceLastClear"), (0x40, "testNotCompletedThisMonitoringCycle"),
     (0x80, "warningIndicatorRequested"),
 ]
+DTC_CATEGORY = {0: "P", 1: "C", 2: "B", 3: "U"}
+NRC_NAMES = {0x11: "serviceNotSupported", 0x12: "subFunctionNotSupported",
+             0x13: "incorrectMessageLength", 0x31: "requestOutOfRange"}
 
-DTC_CATEGORY = {0: "P", 1: "C", 2: "B", 3: "U"}  # bits7-6 of the high byte
+results: list[tuple[str, bool]] = []
 
 
+def check(name: str, ok: bool) -> None:
+    results.append((name, ok))
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+
+
+# ---------------------------------------------------------------- transport
 def send_request(bus: can.Bus, data: list[int]) -> None:
     padded = (data + [0] * 8)[:8]
-    msg = can.Message(arbitration_id=UDS_REQUEST_ID, data=padded, is_extended_id=False)
-    bus.send(msg)
+    bus.send(can.Message(arbitration_id=UDS_REQUEST_ID, data=padded, is_extended_id=False))
 
 
-def _send_flow_control(bus: can.Bus, block_size: int = 0, stmin: int = 0) -> None:
-    """CTS (ContinueToSend), the only Flow Status this demo ever sends."""
-    send_request(bus, [0x30, block_size, stmin, 0, 0, 0, 0, 0])
+def _send_flow_control(bus: can.Bus) -> None:
+    send_request(bus, [0x30, 0x00, 0x00])           # ContinueToSend, BlockSize 0, STmin 0
 
 
-def _recv_matching(bus: can.Bus, expect_id: int, timeout: float) -> can.Message | None:
-    """The bus also carries 0x0C0 and 0x0C1 cyclic broadcasts -- keep
-    draining frames, discarding anything that isn't `expect_id`, until we
-    find a match or the deadline elapses."""
+def _recv_matching(bus: can.Bus, expect_id: int, timeout: float):
+    """The bus also carries 0x0C0/0x0C1/0x0D0/0x320/0x350 -- discard everything but expect_id."""
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
@@ -75,273 +92,220 @@ def _recv_matching(bus: can.Bus, expect_id: int, timeout: float) -> can.Message 
             return None
         if msg.arbitration_id == expect_id:
             return msg
-        # else: unrelated cyclic traffic -- keep waiting.
 
 
 def read_response(bus: can.Bus, timeout: float = ISOTP_TIMEOUT_S) -> bytes | None:
-    """Full ISO-TP receive (Session 13's demo, reused verbatim). Returns the
-    reassembled SID+params payload with any PCI byte(s) already stripped."""
+    """Full ISO-TP receive; returns SID+params with PCI bytes stripped."""
     msg = _recv_matching(bus, UDS_RESPONSE_ID, timeout)
     if msg is None:
         return None
-
     data = bytes(msg.data)
-    pci_type = (data[0] >> 4) & 0x0F
-
-    if pci_type == 0x0:
-        length = data[0] & 0x0F
-        return data[1:1 + length]
-
-    if pci_type != 0x1:
-        print(f"  [ISO-TP] Unexpected leading PCI 0x{data[0]:02X} (expected Single or First Frame)")
+    pci = (data[0] >> 4) & 0x0F
+    if pci == 0x0:                                   # Single Frame
+        return data[1:1 + (data[0] & 0x0F)]
+    if pci != 0x1:
+        print(f"  [ISO-TP] unexpected PCI 0x{data[0]:02X}")
         return None
-
-    total_len = ((data[0] & 0x0F) << 8) | data[1]
+    total = ((data[0] & 0x0F) << 8) | data[1]        # First Frame
     payload = bytearray(data[2:8])
-    print(f"  [ISO-TP] First Frame: total length {total_len}, got {len(payload)} bytes so far")
-
-    _send_flow_control(bus, block_size=0, stmin=0)
-    print("  [ISO-TP] Sent Flow Control: CTS, BlockSize=0, STmin=0")
-
-    expected_seq = 1
-    while len(payload) < total_len:
-        cf_msg = _recv_matching(bus, UDS_RESPONSE_ID, timeout)
-        if cf_msg is None:
-            print("  [ISO-TP] Timed out waiting for a Consecutive Frame")
+    print(f"    [ISO-TP] First Frame, total {total} bytes -> sending Flow Control (CTS)")
+    _send_flow_control(bus)
+    expected = 1
+    while len(payload) < total:
+        cf = _recv_matching(bus, UDS_RESPONSE_ID, timeout)
+        if cf is None:
+            print("    [ISO-TP] timed out waiting for Consecutive Frame")
             return None
-        cf = bytes(cf_msg.data)
-        if (cf[0] & 0xF0) != 0x20:
-            print(f"  [ISO-TP] Expected a Consecutive Frame, got PCI 0x{cf[0]:02X}")
+        d = bytes(cf.data)
+        if (d[0] & 0xF0) != 0x20:
+            print(f"    [ISO-TP] expected Consecutive Frame, got 0x{d[0]:02X}")
             return None
-        seq = cf[0] & 0x0F
-        if seq != expected_seq:
-            print(f"  [ISO-TP] Warning: expected sequence {expected_seq}, got {seq}")
-        payload.extend(cf[1:8])
-        expected_seq = (expected_seq + 1) % 16
-
-    return bytes(payload[:total_len])
+        if (d[0] & 0x0F) != expected:
+            print(f"    [ISO-TP] sequence warning: expected {expected}, got {d[0] & 0x0F}")
+        payload.extend(d[1:8])
+        expected = (expected + 1) % 16
+    return bytes(payload[:total])
 
 
-def read_data_by_id(bus: can.Bus, did: int) -> bytes | None:
-    did_high = (did >> 8) & 0xFF
-    did_low  =  did       & 0xFF
-    send_request(bus, [0x03, 0x22, did_high, did_low, 0, 0, 0, 0])
+def is_negative(resp: bytes | None, sid: int, nrc: int) -> bool:
+    return resp is not None and len(resp) >= 3 and resp[0] == 0x7F and resp[1] == sid and resp[2] == nrc
+
+
+# ---------------------------------------------------------------- services
+def read_did(bus: can.Bus, did: int) -> bytes | None:
+    send_request(bus, [0x03, 0x22, did >> 8, did & 0xFF])
     return read_response(bus)
 
 
-def read_dtcs(bus: can.Bus) -> bytes | None:
-    """SID 0x19, sub-function 0x02 (reportDTCByStatusMask), mask 0xFF."""
-    send_request(bus, [0x03, 0x19, 0x02, 0xFF, 0, 0, 0, 0])
-    return read_response(bus)
+def read_dtcs(bus: can.Bus, mask: int = 0xFF) -> list[tuple[int, int, int]] | None:
+    send_request(bus, [0x03, 0x19, 0x02, mask])
+    r = read_response(bus)
+    if r is None or len(r) < 3 or r[0] != 0x59:
+        return None
+    return [(r[i], r[i + 1], r[i + 2]) for i in range(3, len(r) - 2, 3)]
 
 
 def read_freeze_frame(bus: can.Bus, high: int, low: int) -> bytes | None:
-    """SID 0x19, sub-function 0x04 (reportDTCSnapshotRecordByDTCNumber) --
-    this demo's own wire format (content.md states the freeze-frame
-    objective but never specifies one). Trailing record-number byte is
-    accepted by the ECU but ignored, since this demo only keeps one
-    snapshot per DTC."""
-    send_request(bus, [0x04, 0x19, 0x04, high, low, 0x01, 0, 0])
+    send_request(bus, [0x04, 0x19, 0x04, high, low, 0x01])
     return read_response(bus)
 
 
-def decode_freeze_frame(payload: bytes) -> dict | None:
-    if len(payload) < 7 or payload[0] != 0x59 or payload[1] != 0x04:
-        return None
-    high, low, status, record_num, num_ids = payload[2], payload[3], payload[4], payload[5], payload[6]
-    offset = 7
-    values = {}
-    for _ in range(num_ids):
-        did = (payload[offset] << 8) | payload[offset + 1]
-        if did == DID_ENGINE_RPM:
-            raw = (payload[offset + 2] << 8) | payload[offset + 3]
-            values["rpm"] = decode_rpm(bytes([0x62]) + payload[offset:offset + 4])
-            offset += 4
-        elif did == DID_COOLANT_TEMP:
-            values["coolant_temp"] = payload[offset + 2] - 40.0
-            offset += 3
-        elif did == 0x0103:  # DID_BATTERY_VOLTAGE
-            values["battery_voltage"] = payload[offset + 2] * 0.1
-            offset += 3
-        else:
-            break  # unknown DID -- stop, rather than misparse the rest
-    return {"high": high, "low": low, "status": status, "record": record_num, "values": values}
-
-
-def print_freeze_frame(bus: can.Bus, high: int, low: int) -> None:
-    data = read_freeze_frame(bus, high, low)
-    if data is None:
-        print(f"  Timeout -- no response from ECU")
-        return
-    ff = decode_freeze_frame(data)
-    if ff is None:
-        print(f"  Unexpected payload: {' '.join(f'{b:02X}' for b in data)}")
-        return
-    name = decode_dtc_name(ff["high"], ff["low"])
-    print(f"  {name}  snapshot #{ff['record']}  status={decode_dtc_status(ff['status'])}")
-    for key, val in ff["values"].items():
-        print(f"    {key}: {val:.1f}")
-
-
 def clear_dtcs(bus: can.Bus) -> bool:
-    send_request(bus, [0x04, 0x14, 0xFF, 0xFF, 0xFF, 0, 0, 0])
-    resp = read_response(bus)
-    return resp is not None and len(resp) >= 1 and resp[0] == 0x54
+    send_request(bus, [0x04, 0x14, 0xFF, 0xFF, 0xFF])
+    r = read_response(bus)
+    return r is not None and r[:1] == b"\x54"
 
 
-def ecu_reset(bus: can.Bus) -> bool:
-    send_request(bus, [0x02, 0x11, 0x01, 0, 0, 0, 0, 0])
-    resp = read_response(bus)
-    return resp is not None and len(resp) >= 1 and resp[0] == 0x51
+def ecu_reset(bus: can.Bus, sub: int = 0x01) -> bytes | None:
+    send_request(bus, [0x02, 0x11, sub])
+    return read_response(bus)
 
 
-# --- Decoders: `payload` here is SID + params, PCI already stripped. ---
+# ---------------------------------------------------------------- decoding
+def dtc_name(high: int, low: int) -> str:
+    return f"{DTC_CATEGORY[(high >> 6) & 3]}{(high >> 4) & 3:X}{high & 0x0F:X}{(low >> 4) & 0x0F:X}{low & 0x0F:X}"
 
-def decode_rpm(payload: bytes) -> float | None:
-    if len(payload) < 5 or payload[0] != 0x62:
+
+def status_text(status: int) -> str:
+    names = [n for m, n in DTC_BITS if status & m]
+    return f"0x{status:02X} ({'|'.join(names) if names else 'no bits'})"
+
+
+def decode_freeze_frame(p: bytes) -> dict | None:
+    if len(p) < 7 or p[0] != 0x59 or p[1] != 0x04:
         return None
-    raw = (payload[3] << 8) | payload[4]
-    return raw * 0.25
+    out = {"high": p[2], "low": p[3], "status": p[4], "record": p[5], "values": []}
+    off = 7
+    for _ in range(p[6]):
+        did = (p[off] << 8) | p[off + 1]
+        if did not in DID_INFO:
+            break
+        _, name, unit, length, fn = DID_INFO[did]
+        out["values"].append((did, name, unit, fn(p[off + 2:off + 2 + length])))
+        off += 2 + length
+    return out
 
 
-def decode_temperature(payload: bytes) -> float | None:
-    if len(payload) < 4 or payload[0] != 0x62:
-        return None
-    raw = payload[3]
-    return raw - 40.0  # factor=1.0, offset=-40 -- matches engine_ecu.cpp
+# ---------------------------------------------------------------- test steps
+def step_read_all_dids(bus):
+    print("\n[1] SID 0x22 ReadDataByIdentifier -- every DID in the signal dictionary")
+    for did, name, unit, length, fn in DID_TABLE:
+        r = read_did(bus, did)
+        ok = (r is not None and len(r) == 3 + length and r[0] == 0x62 and (r[1] << 8 | r[2]) == did)
+        if ok:
+            val = fn(r[3:])
+            shown = f"{val:.2f}" if isinstance(val, float) else str(val)
+            print(f"  DID 0x{did:04X}  {name:<28} = {shown} {unit}")
+        check(f"DID 0x{did:04X} {name}", ok)
 
 
-def decode_dtc_name(high: int, low: int) -> str:
-    """content.md Section 1.2: bits7-6 of the high byte select the P/C/B/U
-    category; the remaining nibbles are the four digits of the code."""
-    category = DTC_CATEGORY[(high >> 6) & 0x03]
-    digit1 = (high >> 4) & 0x03
-    digit2 = high & 0x0F
-    digit3 = (low >> 4) & 0x0F
-    digit4 = low & 0x0F
-    return f"{category}{digit1:X}{digit2:X}{digit3:X}{digit4:X}"
+def step_negative_responses(bus):
+    print("\n[2] Negative responses (7F <SID> <NRC>)")
+    r = read_did(bus, 0x9999)
+    check("unknown DID 0x9999 -> 7F 22 31 requestOutOfRange", is_negative(r, 0x22, 0x31))
+    send_request(bus, [0x02, 0x27, 0x01])
+    check("unsupported SID 0x27 -> 7F 27 11 serviceNotSupported", is_negative(read_response(bus), 0x27, 0x11))
+    check("ECUReset sub-function 0x02 -> 7F 11 12 subFunctionNotSupported",
+          is_negative(ecu_reset(bus, 0x02), 0x11, 0x12))
+    send_request(bus, [0x03, 0x19, 0x07, 0xFF])
+    check("ReadDTC sub-function 0x07 -> 7F 19 12 subFunctionNotSupported",
+          is_negative(read_response(bus), 0x19, 0x12))
+    check("freeze frame of non-existent DTC -> 7F 19 31", is_negative(read_freeze_frame(bus, 0x09, 0x99), 0x19, 0x31))
 
 
-def decode_dtc_status(status: int) -> str:
-    names = [name for mask, name in DTC_BITS if status & mask]
-    bits = "|".join(names) if names else "no bits set"
-    return f"0x{status:02X} ({bits})"
+def step_wait_for_confirmed(bus, timeout_s: float) -> bool:
+    print(f"\n[3] Watching DTC lifecycle live (up to {timeout_s:.0f} s; faults appear on the ECU's 60 s drive cycle)")
+    t0 = time.monotonic()
+    last = None
+    saw_pending = False
+    while time.monotonic() - t0 < timeout_s:
+        recs = read_dtcs(bus, 0xFF)
+        if recs is None:
+            print("  no answer from ECU -- is engine_ecu running?")
+            return False
+        state = tuple(sorted(recs))
+        if state != last:
+            print(f"  t+{time.monotonic() - t0:5.1f}s  " +
+                  ("no DTCs" if not recs else "; ".join(f"{dtc_name(h, l)}={status_text(s)}" for h, l, s in recs)))
+            last = state
+        if any(s == 0x05 for _, _, s in recs):
+            saw_pending = True
+        if any(s & 0x08 for _, _, s in recs):
+            check("a DTC reached confirmed (bit3) after being pending" if saw_pending
+                  else "a DTC is confirmed (was already past pending when we started)", True)
+            return True
+        time.sleep(1.0)
+    check("a DTC confirmed within the wait window", False)
+    return False
 
 
-def decode_dtcs(payload: bytes) -> list[tuple[int, int, int]] | None:
-    """Returns a list of (high, low, status) 3-byte DTC records."""
-    if len(payload) < 3 or payload[0] != 0x59:
-        return None
-    records = []
-    for i in range(3, len(payload) - 2, 3):
-        records.append((payload[i], payload[i + 1], payload[i + 2]))
-    return records
+def step_dtc_services(bus):
+    print("\n[4] SID 0x19 ReadDTCInformation")
+    print("  sub 0x02, mask 0xFF (all stored DTCs):")
+    all_dtcs = read_dtcs(bus, 0xFF) or []
+    for h, l, s in all_dtcs:
+        print(f"    {dtc_name(h, l)}  status={status_text(s)}")
+    check("reportDTCByStatusMask(0xFF) returned records", len(all_dtcs) > 0)
+
+    print("  sub 0x02, mask 0x08 (confirmed only):")
+    confirmed = read_dtcs(bus, 0x08) or []
+    for h, l, s in confirmed:
+        print(f"    {dtc_name(h, l)}  status={status_text(s)}")
+    check("mask 0x08 returns only confirmed DTCs", all(s & 0x08 for _, _, s in confirmed) and len(confirmed) > 0)
+
+    print("  sub 0x04 (freeze frame) for every stored DTC:")
+    ok_all = True
+    for h, l, _ in all_dtcs:
+        ff = decode_freeze_frame(read_freeze_frame(bus, h, l) or b"")
+        if ff is None:
+            ok_all = False
+            print(f"    {dtc_name(h, l)}: no/invalid freeze frame")
+            continue
+        print(f"    {dtc_name(h, l)}  snapshot #{ff['record']}  status={status_text(ff['status'])}")
+        for did, name, unit, val in ff["values"]:
+            print(f"        0x{did:04X} {name:<24} {val:.2f} {unit}")
+        ok_all = ok_all and len(ff["values"]) == 6
+    check("freeze frame (6 identifiers) readable for every stored DTC", ok_all and len(all_dtcs) > 0)
 
 
-def print_dtcs(bus: can.Bus) -> None:
-    data = read_dtcs(bus)
-    if data is None:
-        print("  Timeout -- no response from ECU")
-        return
-    records = decode_dtcs(data)
-    if records is None:
-        print(f"  Unexpected payload: {' '.join(f'{b:02X}' for b in data)}")
-        return
-    if not records:
-        print("  No active DTCs.")
-        return
-    for high, low, status in records:
-        name = decode_dtc_name(high, low)
-        print(f"  {name}  (0x{high:02X} 0x{low:02X})  status={decode_dtc_status(status)}")
+def step_clear_and_reset(bus):
+    print("\n[5] SID 0x14 ClearDiagnosticInformation")
+    check("ClearDiagnosticInformation -> positive response 0x54", clear_dtcs(bus))
+    after = read_dtcs(bus, 0xFF)
+    print("  DTCs right after clear:", "none" if not after else after)
+    check("no confirmed DTC remains right after clear", after is not None and not any(s & 0x08 for _, _, s in after))
+
+    print("\n[6] SID 0x11 ECUReset (hardReset)")
+    r = ecu_reset(bus, 0x01)
+    check("ECUReset -> positive response 51 01", r == b"\x51\x01")
 
 
-def main():
-    print("=== UDS Fault Diagnostic Tool (Session 14 Demo) ===")
-    print("Connecting to vcan0...\n")
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--channel", default="vcan0")
+    ap.add_argument("--wait-timeout", type=float, default=90.0,
+                    help="seconds to wait for a DTC to confirm (0 = skip DTC tests)")
+    args = ap.parse_args()
 
-    bus = can.Bus(interface='socketcan', channel='vcan0')
-
+    print("=== UDS Diagnostic Tester (EV theme: Engine + BMS) ===")
+    print(f"Connecting to {args.channel} ...")
+    bus = can.Bus(interface="socketcan", channel=args.channel)
     try:
-        print("[Read DID 0x0101 - Engine RPM]")
-        data = read_data_by_id(bus, DID_ENGINE_RPM)
-        if data:
-            rpm = decode_rpm(data)
-            print(f"  RPM: {rpm:.0f}" if rpm is not None else "  Error decoding RPM")
-        else:
-            print("  Timeout -- no response from ECU")
-        print()
-
-        print("[Read DID 0x0102 - Coolant Temperature]")
-        data = read_data_by_id(bus, DID_COOLANT_TEMP)
-        if data:
-            temp = decode_temperature(data)
-            print(f"  Temperature: {temp:.1f}°C" if temp is not None else "  Error decoding temp")
-        else:
-            print("  Timeout -- no response from ECU")
-        print()
-
-        print("[Read DID 0x0201 - Vehicle Speed]")
-        data = read_data_by_id(bus, DID_VEHICLE_SPEED)
-
-        if data:
-            raw = (data[-2] << 8) | data[-1]
-            speed = raw * 0.01
-            print(f"  Vehicle Speed: {speed:.2f} km/h")
-        else:
-            print("  Timeout -- no response from ECU")
-
-        print()
-
-        print("[Read DID 0x0103 - Battery Voltage]")
-        data = read_data_by_id(bus, DID_BATTERY_VOLTAGE)
-
-        if data:
-            raw = (data[-2] << 8) | data[-1]
-            voltage = raw * 0.01
-            print(f"  Battery Voltage: {voltage:.2f} V")
-        else:
-            print("  Timeout -- no response from ECU")
-
-        print()
-
-        print("[ReadDTCInformation (SID 0x19) -- current DTCs]")
-        print_dtcs(bus)
-        print()
-
-        print("[Waiting 3s for the next monitoring cycle -- watch for pending -> confirmed promotion]")
-        time.sleep(3)
-        print("[ReadDTCInformation (SID 0x19) -- after waiting]")
-        print_dtcs(bus)
-        print()
-
-        print("[ReadDTCInformation sub-function 0x04 -- freeze frame per active DTC]")
-        data = read_dtcs(bus)
-        records = decode_dtcs(data) if data else None
-        if records:
-            for high, low, _status in records:
-                print_freeze_frame(bus, high, low)
-        else:
-            print("  No active DTCs to snapshot.")
-        print()
-
-        print("[ClearDiagnosticInformation (SID 0x14)]")
-        ok = clear_dtcs(bus)
-        print("  Response: 54 -> DTCs cleared successfully" if ok else "  Failed to clear DTCs")
-        print()
-
-        print("[ReadDTCInformation (SID 0x19) -- after clearing, should be empty]")
-        print_dtcs(bus)
-
-        print()
-        print("[ECUReset (SID 0x11) -- hard reset]")
-        ok = ecu_reset(bus)
-        print("  Response: 51 01 -> ECU reset requested successfully"
-            if ok else
-            "  Failed to reset ECU")
-
+        step_read_all_dids(bus)
+        step_negative_responses(bus)
+        if args.wait_timeout > 0:
+            if step_wait_for_confirmed(bus, args.wait_timeout):
+                step_dtc_services(bus)
+        step_clear_and_reset(bus)
     finally:
         bus.shutdown()
 
+    failed = [n for n, ok in results if not ok]
+    print(f"\n=== {len(results) - len(failed)}/{len(results)} checks passed ===")
+    for n in failed:
+        print(f"  FAILED: {n}")
+    return 1 if failed else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
